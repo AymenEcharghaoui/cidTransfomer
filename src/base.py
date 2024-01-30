@@ -3,6 +3,9 @@ import torch.nn as nn
 import numpy as np
 from transformers import GPT2Model, GPT2Config
 from torch.utils.data import Dataset
+import pdb as pdb
+from torch.utils.data import DataLoader
+
 
 class GaussianSampler():
     def __init__(self, n_dims, bias=None, scale=None):
@@ -178,6 +181,7 @@ class CidTransformerModel(nn.Module):
         self._read_in = nn.Linear(1, n_embd)
         self._backbone = GPT2Model(configuration)
         self._read_out = nn.Linear(n_embd, 2)
+        self.const = - 0.5*np.log(2*torch.pi)
 
     @staticmethod
     def _combine(xs_b, ys_b):
@@ -193,10 +197,12 @@ class CidTransformerModel(nn.Module):
         embeds = self._read_in(zs)
         output = self._backbone(inputs_embeds=embeds).last_hidden_state
         mean  = self._read_out(output)[:,:,0]
-        std = torch.exp(self._read_out(output)[:,:,1])
-        log_prediction = -0.5*((zs[:,:,0]-mean)/std)**2 - torch.log(std*np.sqrt(2*np.pi))
-        filtered_prediction = torch.arange(points*(dim+1))%(dim+1)==(dim-1)
-        return mean[:,filtered_prediction], std[:,filtered_prediction], log_prediction[:,torch.arange(points*(dim+1))%(dim+1)!=dim]
+        #std = torch.exp(self._read_out(output)[:,:,1])
+        log_std = self._read_out(output)[:,:,1]
+        log_ppd = -0.5*((zs[:,:,0]-mean)/torch.exp(log_std))**2 - log_std + self.const
+        x2y_prediction = torch.arange(points*(dim+1))%(dim+1)==(dim-1)
+        x2x_prediction = torch.arange(points*(dim+1))%(dim+1)!=dim
+        return mean[:,x2y_prediction], log_std[:,x2y_prediction], log_ppd[:,x2x_prediction]
     
 class CidModel(nn.Module):
     def __init__(self, n_dims, n_positions, device):
@@ -207,24 +213,48 @@ class CidModel(nn.Module):
         self.alphas = 1/(torch.arange(end=n_positions-1,device=device)+1)
     def forward(self,xs,ys): 
         batch , points, dim = xs.shape
-        log_prediction = self.cidTransformerModel(xs,ys)[-1] # batch x (points*dims)
-        log_prediction = log_prediction.view(batch,points,dim) # batch x points x dim 
-        log_prediction_f = log_prediction[:,1:,:] #.transpose(1,2)  # batch x (points-1) x dim 
-        log_prediction = log_prediction[:,:-1,:] #.transpose(1,2) # batch x (points-1) x dim
-        copulaXfactor = torch.exp(torch.sum(torch.log(self.copulaXmodel(log_prediction_f,log_prediction)),dim=-1)) # batch x (points-1)
-        copulaYfactor = self.copulaYmodel(log_prediction_f[:,:,-1],log_prediction[:,:,-1]) # batch x (points-1)
+        log_ppd = self.cidTransformerModel(xs,ys)[-1] # batch x (points*dims)
+        # test if log_ppd conatins nan
+        #if torch.isnan(log_ppd).any():
+        #pdb.set_trace()
+        log_ppd = log_ppd.view(batch,points,dim) # batch x points x dim 
+        log_ppd_f = log_ppd[:,1:,:] #.transpose(1,2)  # batch x (points-1) x dim 
+        log_ppd = log_ppd[:,:-1,:] #.transpose(1,2) # batch x (points-1) x dim
+        copulaXfactor = torch.exp(torch.sum(torch.log(self.copulaXmodel(log_ppd_f,log_ppd)),dim=-1)) # batch x (points-1)
+        copulaYfactor = self.copulaYmodel(log_ppd_f[:,:,-1],log_ppd[:,:,-1]) # batch x (points-1)
         alphas = self.alphas[:points-1]
         result = torch.log(1-alphas+alphas*copulaYfactor*copulaXfactor)-torch.log(1-alphas+alphas*copulaXfactor) # batch x (points-1)
-        return torch.cumsum(result,dim=-1),log_prediction[:,:,-1]    
+        return torch.cumsum(result,dim=-1),log_ppd[:,:,-1]    
     
 
 class CidLoss(nn.Module):
     def __init__(self):
         super(CidLoss, self).__init__()
-    def forward(self, log_ppds,log_predictions):
-        loss_value = (log_ppds-log_predictions).square().mean()
+    def forward(self, log_ppd_2match,log_ppd):
+        #loss_value = (log_ppds-log_predictions).square().mean()
+        loss_value = ((log_ppd-log_ppd_2match)*torch.exp(log_ppd)).mean()
         return loss_value
 
 def get_model_size(model):
     total_params = sum(p.numel() for p in model.parameters())
     return total_params
+
+def get_train_dataloader(curriculum, batch_size, n_dims, num_tasks, start):
+    seeds_ws = list(range(start,num_tasks+start))
+    seeds_xs = list(range(start+num_tasks,start+2*num_tasks))
+    data_sampler = GaussianSampler(n_dims)
+    task = LinearRegression(n_dims, num_tasks, seeds=seeds_ws) 
+    X = data_sampler.sample_xs(curriculum.n_points,num_tasks,curriculum.n_dims_truncated,seeds=seeds_xs)
+    Y = task.evaluate(X)
+    dataset = TrainDataset(X,Y)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    return dataloader
+
+def get_val_data(n_points,n_dims,num_tasks_val,device):
+    seeds_ws = list(range(1,1+num_tasks_val))
+    seeds_xs = list(range(1+num_tasks_val,1+2*num_tasks_val))
+    data_sampler = GaussianSampler(n_dims)
+    task = LinearRegression(n_dims, num_tasks_val, seeds=seeds_ws)
+    val_xs = data_sampler.sample_xs(n_points,num_tasks_val,n_dims,seeds=seeds_xs).to(device)
+    val_ys = task.evaluate(val_xs).to(device)
+    return val_xs,val_ys
